@@ -1,0 +1,81 @@
+-- ============================================================
+-- TÜM STOKLAR İÇİN WMA LİSTESİ
+-- ============================================================
+
+DECLARE @TARIH DATETIME = GETDATE()  -- İstediğin tarihi değiştir
+
+SELECT 
+    st.STOK_KODU,
+    st.STOK_ADI,
+    -- Mevcut Bakiye
+    ISNULL((
+        SELECT SUM(CASE WHEN STHAR_GCKOD = 'G' THEN STHAR_GCMIK ELSE -STHAR_GCMIK END)
+        FROM TBLSTHAR 
+        WHERE STOK_KODU = st.STOK_KODU AND STHAR_TARIH <= @TARIH
+    ), 0) AS BAKIYE,
+    -- Döviz bilgisi
+    dbo.fn_StokDovizTip(st.STOK_KODU) AS DOVTIP,
+    dbo.fn_DovizAdi(dbo.fn_StokDovizTip(st.STOK_KODU)) AS DOVIZ,
+    -- WMA değerleri
+    dbo.fn_WMA(st.STOK_KODU, @TARIH, NULL) AS WMA_ORIJINAL,
+    dbo.fn_WMA_EUR(st.STOK_KODU, @TARIH) AS WMA_EUR,
+    dbo.fn_WMA_Cevir(st.STOK_KODU, @TARIH, 2) AS WMA_USD,
+    dbo.fn_WMA_Cevir(st.STOK_KODU, @TARIH, 0) AS WMA_TL,
+    -- Stok Değeri (Bakiye × WMA)
+    ISNULL((
+        SELECT SUM(CASE WHEN STHAR_GCKOD = 'G' THEN STHAR_GCMIK ELSE -STHAR_GCMIK END)
+        FROM TBLSTHAR 
+        WHERE STOK_KODU = st.STOK_KODU AND STHAR_TARIH <= @TARIH
+    ), 0) * dbo.fn_WMA_EUR(st.STOK_KODU, @TARIH) AS STOK_DEGERI_EUR
+FROM TBLSTSABIT st
+WHERE EXISTS (
+    SELECT 1 FROM TBLSTHAR h 
+    WHERE h.STOK_KODU = st.STOK_KODU 
+      AND h.STHAR_TARIH <= @TARIH
+)
+ORDER BY st.STOK_KODU
+
+
+-- ============================================================
+-- SADECE BAKİYESİ OLAN STOKLAR
+-- ============================================================
+
+/*
+DECLARE @TARIH2 DATETIME = GETDATE()
+
+SELECT 
+    st.STOK_KODU,
+    st.STOK_ADI,
+    b.BAKIYE,
+    dbo.fn_DovizAdi(dbo.fn_StokDovizTip(st.STOK_KODU)) AS DOVIZ,
+    dbo.fn_WMA(st.STOK_KODU, @TARIH2, NULL) AS WMA,
+    dbo.fn_WMA_EUR(st.STOK_KODU, @TARIH2) AS WMA_EUR,
+    b.BAKIYE * dbo.fn_WMA_EUR(st.STOK_KODU, @TARIH2) AS DEGER_EUR
+FROM TBLSTSABIT st
+CROSS APPLY (
+    SELECT SUM(CASE WHEN STHAR_GCKOD = 'G' THEN STHAR_GCMIK ELSE -STHAR_GCMIK END) AS BAKIYE
+    FROM TBLSTHAR WHERE STOK_KODU = st.STOK_KODU AND STHAR_TARIH <= @TARIH2
+) b
+WHERE b.BAKIYE > 0
+ORDER BY st.STOK_KODU
+*/
+
+
+-- ============================================================
+-- ÖZET: TOPLAM STOK DEĞERİ
+-- ============================================================
+
+/*
+DECLARE @TARIH3 DATETIME = GETDATE()
+
+SELECT 
+    COUNT(*) AS STOK_ADEDI,
+    SUM(b.BAKIYE * dbo.fn_WMA_EUR(st.STOK_KODU, @TARIH3)) AS TOPLAM_DEGER_EUR,
+    SUM(b.BAKIYE * dbo.fn_WMA_Cevir(st.STOK_KODU, @TARIH3, 0)) AS TOPLAM_DEGER_TL
+FROM TBLSTSABIT st
+CROSS APPLY (
+    SELECT SUM(CASE WHEN STHAR_GCKOD = 'G' THEN STHAR_GCMIK ELSE -STHAR_GCMIK END) AS BAKIYE
+    FROM TBLSTHAR WHERE STOK_KODU = st.STOK_KODU AND STHAR_TARIH <= @TARIH3
+) b
+WHERE b.BAKIYE > 0
+*/
