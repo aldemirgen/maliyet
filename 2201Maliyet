@@ -1,0 +1,476 @@
+USE [CFM]
+GO
+
+-- ============================================================
+-- TÜM ESKİ FONKSİYONLARI TEMİZLE
+-- ============================================================
+DROP FUNCTION IF EXISTS dbo.fn_MaliyetFIFO_Oto
+DROP FUNCTION IF EXISTS dbo.fn_MaliyetFIFO_EUR
+DROP FUNCTION IF EXISTS dbo.fn_MaliyetFIFO
+DROP FUNCTION IF EXISTS dbo.fn_MaliyetCevir
+DROP FUNCTION IF EXISTS dbo.fn_MaliyetEUR
+DROP FUNCTION IF EXISTS dbo.fn_MaliyetOto
+DROP FUNCTION IF EXISTS dbo.fn_Maliyet
+DROP FUNCTION IF EXISTS dbo.fn_StokDovizTip
+DROP FUNCTION IF EXISTS dbo.fn_Parite
+DROP FUNCTION IF EXISTS dbo.fn_Kur
+DROP FUNCTION IF EXISTS dbo.fn_DovizAdi
+DROP FUNCTION IF EXISTS dbo.fn_WMA
+DROP FUNCTION IF EXISTS dbo.fn_WMA_EUR
+DROP FUNCTION IF EXISTS dbo.fn_WMA_Cevir
+GO
+
+DROP PROCEDURE IF EXISTS dbo.sp_UretimMaliyetGuncelle
+DROP PROCEDURE IF EXISTS dbo.sp_UretimMaliyetTest
+GO
+
+-- ============================================================
+-- BÖLÜM 1: YARDIMCI FONKSİYONLAR
+-- ============================================================
+
+-- Döviz kuru getir
+CREATE FUNCTION dbo.fn_Kur
+(
+    @TARIH DATETIME,
+    @DOVTIP TINYINT  -- 0:TL, 1:EUR, 2:USD
+)
+RETURNS DECIMAL(28, 10)
+AS
+BEGIN
+    IF @DOVTIP = 0 RETURN 1
+    
+    DECLARE @Result DECIMAL(28, 10)
+    
+    SELECT TOP 1 @Result = DOV_ALIS
+    FROM NETSIS.dbo.DOVIZ
+    WHERE SIRA = @DOVTIP AND TARIH <= @TARIH AND DOV_ALIS > 0
+    ORDER BY TARIH DESC
+    
+    IF @Result IS NULL
+        SELECT TOP 1 @Result = DOV_ALIS
+        FROM NETSIS.dbo.DOVIZ
+        WHERE SIRA = @DOVTIP AND DOV_ALIS > 0
+        ORDER BY TARIH ASC
+    
+    RETURN ISNULL(@Result, 1)
+END
+GO
+
+-- Döviz adı
+CREATE FUNCTION dbo.fn_DovizAdi(@DOVTIP TINYINT)
+RETURNS VARCHAR(3)
+AS
+BEGIN
+    RETURN CASE @DOVTIP WHEN 0 THEN 'TL' WHEN 1 THEN 'EUR' WHEN 2 THEN 'USD' ELSE 'TL' END
+END
+GO
+
+-- Stokun son giriş döviz tipi
+CREATE FUNCTION dbo.fn_StokDovizTip(@STOK_KODU VARCHAR(50))
+RETURNS TINYINT
+AS
+BEGIN
+    DECLARE @Result TINYINT = 0
+    
+    SELECT TOP 1 @Result = ISNULL(STHAR_DOVTIP, 0)
+    FROM dbo.TBLSTHAR
+    WHERE STOK_KODU = @STOK_KODU
+      AND STHAR_GCKOD = 'G'
+      AND STHAR_HTUR = 'J'
+      AND STHAR_GCMIK > 0
+    ORDER BY STHAR_TARIH DESC
+    
+    RETURN @Result
+END
+GO
+
+-- ============================================================
+-- BÖLÜM 2: WEIGHTED MOVING AVERAGE (WMA)
+-- ============================================================
+-- 
+-- Formül: Her giriş anında yeniden hesaplanır
+-- Yeni WMA = (Mevcut Bakiye × Eski WMA + Giriş Miktar × Giriş Fiyat) / (Mevcut Bakiye + Giriş Miktar)
+-- Çıkışlarda WMA değişmez, sadece bakiye azalır
+--
+-- Girişler: GCKOD='G' (tüm girişler)
+-- Çıkışlar: GCKOD='C' (tüm çıkışlar)
+-- ============================================================
+
+CREATE FUNCTION dbo.fn_WMA
+(
+    @STOK_KODU VARCHAR(50),
+    @TARIH DATETIME,
+    @DOVTIP TINYINT = NULL  -- NULL: Stokun kendi dövizi
+)
+RETURNS DECIMAL(28, 15)
+AS
+BEGIN
+    IF @DOVTIP IS NULL
+        SET @DOVTIP = dbo.fn_StokDovizTip(@STOK_KODU)
+    
+    DECLARE @WMA DECIMAL(28, 15) = 0
+    DECLARE @Bakiye DECIMAL(28, 15) = 0
+    
+    -- Tüm hareketleri sırayla işle
+    DECLARE @Miktar DECIMAL(28, 15)
+    DECLARE @BirimFiyat DECIMAL(28, 15)
+    DECLARE @IsGiris BIT
+    
+    DECLARE cur CURSOR LOCAL FAST_FORWARD FOR
+        SELECT 
+            CASE WHEN STHAR_GCKOD = 'G' THEN 1 ELSE 0 END AS IS_GIRIS,
+            STHAR_GCMIK AS MIKTAR,
+            -- Birim fiyatı hedef dövize çevir
+            CASE 
+                WHEN STHAR_GCKOD = 'C' THEN 0  -- Çıkışlarda fiyat önemsiz
+                WHEN ISNULL(STHAR_DOVFIAT, 0) > 0 THEN
+                    CASE 
+                        WHEN ISNULL(STHAR_DOVTIP, 0) = @DOVTIP THEN STHAR_DOVFIAT
+                        WHEN @DOVTIP = 0 THEN STHAR_DOVFIAT * dbo.fn_Kur(STHAR_TARIH, ISNULL(STHAR_DOVTIP, 0))
+                        WHEN ISNULL(STHAR_DOVTIP, 0) = 0 THEN STHAR_DOVFIAT / dbo.fn_Kur(STHAR_TARIH, @DOVTIP)
+                        ELSE STHAR_DOVFIAT * dbo.fn_Kur(STHAR_TARIH, ISNULL(STHAR_DOVTIP, 0)) / dbo.fn_Kur(STHAR_TARIH, @DOVTIP)
+                    END
+                WHEN ISNULL(STHAR_NF, 0) > 0 AND STHAR_GCMIK > 0 THEN
+                    CASE 
+                        WHEN @DOVTIP = 0 THEN STHAR_NF / STHAR_GCMIK
+                        ELSE (STHAR_NF / STHAR_GCMIK) / dbo.fn_Kur(STHAR_TARIH, @DOVTIP)
+                    END
+                ELSE 0
+            END AS BIRIM_FIYAT
+        FROM dbo.TBLSTHAR
+        WHERE STOK_KODU = @STOK_KODU
+          AND STHAR_TARIH <= @TARIH
+          AND STHAR_GCMIK > 0
+        ORDER BY STHAR_TARIH ASC, INCKEYNO ASC
+    
+    OPEN cur
+    FETCH NEXT FROM cur INTO @IsGiris, @Miktar, @BirimFiyat
+    
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        IF @IsGiris = 1 AND @BirimFiyat > 0
+        BEGIN
+            -- Giriş: WMA yeniden hesapla
+            -- WMA = (Bakiye × WMA + Miktar × Fiyat) / (Bakiye + Miktar)
+            IF @Bakiye + @Miktar > 0
+                SET @WMA = (@Bakiye * @WMA + @Miktar * @BirimFiyat) / (@Bakiye + @Miktar)
+            SET @Bakiye = @Bakiye + @Miktar
+        END
+        ELSE IF @IsGiris = 1 AND @BirimFiyat = 0
+        BEGIN
+            -- Fiyatsız giriş: sadece bakiye artar, WMA değişmez
+            SET @Bakiye = @Bakiye + @Miktar
+        END
+        ELSE
+        BEGIN
+            -- Çıkış: sadece bakiye azalır, WMA değişmez
+            SET @Bakiye = @Bakiye - @Miktar
+            IF @Bakiye < 0 SET @Bakiye = 0
+        END
+        
+        FETCH NEXT FROM cur INTO @IsGiris, @Miktar, @BirimFiyat
+    END
+    
+    CLOSE cur
+    DEALLOCATE cur
+    
+    RETURN ISNULL(@WMA, 0)
+END
+GO
+
+-- EUR cinsinden WMA
+CREATE FUNCTION dbo.fn_WMA_EUR
+(
+    @STOK_KODU VARCHAR(50),
+    @TARIH DATETIME
+)
+RETURNS DECIMAL(28, 15)
+AS
+BEGIN
+    RETURN dbo.fn_WMA(@STOK_KODU, @TARIH, 1)
+END
+GO
+
+-- İstenen dövize çevrilmiş WMA
+CREATE FUNCTION dbo.fn_WMA_Cevir
+(
+    @STOK_KODU VARCHAR(50),
+    @TARIH DATETIME,
+    @HEDEF_DOVTIP TINYINT
+)
+RETURNS DECIMAL(28, 15)
+AS
+BEGIN
+    RETURN dbo.fn_WMA(@STOK_KODU, @TARIH, @HEDEF_DOVTIP)
+END
+GO
+
+-- ============================================================
+-- BÖLÜM 3: ÜRETİM MALİYET GÜNCELLEME PROSEDÜRÜ
+-- ============================================================
+
+CREATE PROCEDURE dbo.sp_UretimMaliyetGuncelle
+    @YIL INT = NULL,
+    @AY INT = NULL,
+    @HEDEF_DOVTIP TINYINT = NULL  -- NULL: Dinamik, 0:TL, 1:EUR, 2:USD
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    IF @YIL IS NULL OR @AY IS NULL
+    BEGIN
+        SET @YIL = YEAR(DATEADD(MONTH, -1, GETDATE()))
+        SET @AY = MONTH(DATEADD(MONTH, -1, GETDATE()))
+    END
+    
+    DECLARE @BASLANGIC_TARIH DATETIME = DATEFROMPARTS(@YIL, @AY, 1)
+    DECLARE @BITIS_TARIH DATETIME = EOMONTH(@BASLANGIC_TARIH)
+    DECLARE @WMA_TARIH DATETIME = DATEADD(DAY, -1, @BASLANGIC_TARIH)  -- Dönem başından 1 gün önce
+    
+    DECLARE @HammaddeCount INT = 0
+    DECLARE @MamulCount INT = 0
+    DECLARE @ErrorMsg NVARCHAR(4000)
+    
+    BEGIN TRY
+        BEGIN TRANSACTION
+        
+        -- ============================================================
+        -- ADIM 1: Hammadde çıkışlarını güncelle (C+C)
+        -- WMA dönem başındaki bakiyeye göre hesaplanır
+        -- ============================================================
+        IF @HEDEF_DOVTIP IS NULL
+        BEGIN
+            UPDATE h
+            SET h.STHAR_DOVFIAT = dbo.fn_WMA(h.STOK_KODU, @WMA_TARIH, NULL),
+                h.STHAR_DOVTIP = dbo.fn_StokDovizTip(h.STOK_KODU)
+            FROM dbo.TBLSTHAR h
+            WHERE h.STHAR_GCKOD = 'C'
+              AND h.STHAR_HTUR = 'C'
+              AND h.STHAR_TARIH >= @BASLANGIC_TARIH
+              AND h.STHAR_TARIH <= @BITIS_TARIH
+        END
+        ELSE
+        BEGIN
+            UPDATE h
+            SET h.STHAR_DOVFIAT = dbo.fn_WMA(h.STOK_KODU, @WMA_TARIH, @HEDEF_DOVTIP),
+                h.STHAR_DOVTIP = @HEDEF_DOVTIP
+            FROM dbo.TBLSTHAR h
+            WHERE h.STHAR_GCKOD = 'C'
+              AND h.STHAR_HTUR = 'C'
+              AND h.STHAR_TARIH >= @BASLANGIC_TARIH
+              AND h.STHAR_TARIH <= @BITIS_TARIH
+        END
+        
+        SET @HammaddeCount = @@ROWCOUNT
+        
+        -- ============================================================
+        -- ADIM 2: Mamul girişlerini güncelle (G+C)
+        -- Hammadde toplamından hesaplanır
+        -- ============================================================
+        IF @HEDEF_DOVTIP IS NOT NULL
+        BEGIN
+            ;WITH HammaddeToplam AS (
+                SELECT 
+                    h.FISNO,
+                    CAST(h.STHAR_TARIH AS DATE) AS URETIM_TARIHI,
+                    SUM(h.STHAR_GCMIK * ISNULL(h.STHAR_DOVFIAT, 0)) AS HAMMADDE_TOPLAM
+                FROM dbo.TBLSTHAR h
+                WHERE h.STHAR_GCKOD = 'C'
+                  AND h.STHAR_HTUR = 'C'
+                  AND h.STHAR_TARIH >= @BASLANGIC_TARIH
+                  AND h.STHAR_TARIH <= @BITIS_TARIH
+                GROUP BY h.FISNO, CAST(h.STHAR_TARIH AS DATE)
+            )
+            UPDATE m
+            SET m.STHAR_DOVFIAT = CASE WHEN m.STHAR_GCMIK > 0 THEN ISNULL(ht.HAMMADDE_TOPLAM, 0) / m.STHAR_GCMIK ELSE 0 END,
+                m.STHAR_DOVTIP = @HEDEF_DOVTIP
+            FROM dbo.TBLSTHAR m
+            LEFT JOIN HammaddeToplam ht ON m.FISNO = ht.FISNO AND CAST(m.STHAR_TARIH AS DATE) = ht.URETIM_TARIHI
+            WHERE m.STHAR_GCKOD = 'G'
+              AND m.STHAR_HTUR = 'C'
+              AND m.STHAR_TARIH >= @BASLANGIC_TARIH
+              AND m.STHAR_TARIH <= @BITIS_TARIH
+        END
+        ELSE
+        BEGIN
+            ;WITH HammaddeDoviz AS (
+                SELECT 
+                    h.FISNO,
+                    CAST(h.STHAR_TARIH AS DATE) AS URETIM_TARIHI,
+                    dbo.fn_StokDovizTip(h.STOK_KODU) AS DOVTIP,
+                    COUNT(*) AS CNT,
+                    ROW_NUMBER() OVER (PARTITION BY h.FISNO, CAST(h.STHAR_TARIH AS DATE) ORDER BY COUNT(*) DESC) AS RN
+                FROM dbo.TBLSTHAR h
+                WHERE h.STHAR_GCKOD = 'C' AND h.STHAR_HTUR = 'C'
+                  AND h.STHAR_TARIH >= @BASLANGIC_TARIH AND h.STHAR_TARIH <= @BITIS_TARIH
+                  AND ISNULL(h.STHAR_DOVFIAT, 0) > 0
+                GROUP BY h.FISNO, CAST(h.STHAR_TARIH AS DATE), dbo.fn_StokDovizTip(h.STOK_KODU)
+            ),
+            EnCokDoviz AS (
+                SELECT FISNO, URETIM_TARIHI, DOVTIP FROM HammaddeDoviz WHERE RN = 1
+            ),
+            HammaddeToplam AS (
+                SELECT 
+                    h.FISNO,
+                    CAST(h.STHAR_TARIH AS DATE) AS URETIM_TARIHI,
+                    eck.DOVTIP AS HEDEF_DOVTIP,
+                    SUM(h.STHAR_GCMIK * h.STHAR_DOVFIAT * 
+                        CASE WHEN ISNULL(h.STHAR_DOVTIP, 0) = eck.DOVTIP THEN 1
+                             ELSE dbo.fn_Kur(h.STHAR_TARIH, ISNULL(h.STHAR_DOVTIP, 0)) / dbo.fn_Kur(h.STHAR_TARIH, eck.DOVTIP)
+                        END
+                    ) AS HAMMADDE_TOPLAM
+                FROM dbo.TBLSTHAR h
+                INNER JOIN EnCokDoviz eck ON h.FISNO = eck.FISNO AND CAST(h.STHAR_TARIH AS DATE) = eck.URETIM_TARIHI
+                WHERE h.STHAR_GCKOD = 'C' AND h.STHAR_HTUR = 'C'
+                  AND h.STHAR_TARIH >= @BASLANGIC_TARIH AND h.STHAR_TARIH <= @BITIS_TARIH
+                GROUP BY h.FISNO, CAST(h.STHAR_TARIH AS DATE), eck.DOVTIP
+            )
+            UPDATE m
+            SET m.STHAR_DOVFIAT = CASE WHEN m.STHAR_GCMIK > 0 THEN ISNULL(ht.HAMMADDE_TOPLAM, 0) / m.STHAR_GCMIK ELSE 0 END,
+                m.STHAR_DOVTIP = ht.HEDEF_DOVTIP
+            FROM dbo.TBLSTHAR m
+            INNER JOIN HammaddeToplam ht ON m.FISNO = ht.FISNO AND CAST(m.STHAR_TARIH AS DATE) = ht.URETIM_TARIHI
+            WHERE m.STHAR_GCKOD = 'G'
+              AND m.STHAR_HTUR = 'C'
+              AND m.STHAR_TARIH >= @BASLANGIC_TARIH
+              AND m.STHAR_TARIH <= @BITIS_TARIH
+        END
+        
+        SET @MamulCount = @@ROWCOUNT
+        
+        COMMIT TRANSACTION
+        
+        PRINT '=========================================='
+        PRINT 'Üretim Maliyet Güncelleme (WMA) Tamamlandı'
+        PRINT 'Dönem: ' + CAST(@YIL AS VARCHAR) + '/' + RIGHT('0' + CAST(@AY AS VARCHAR), 2)
+        PRINT 'Döviz: ' + ISNULL(dbo.fn_DovizAdi(@HEDEF_DOVTIP), 'DİNAMİK')
+        PRINT 'WMA Tarihi: ' + CONVERT(VARCHAR, @WMA_TARIH, 104)
+        PRINT 'Hammadde: ' + CAST(@HammaddeCount AS VARCHAR)
+        PRINT 'Mamul: ' + CAST(@MamulCount AS VARCHAR)
+        PRINT '=========================================='
+        
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION
+        SET @ErrorMsg = ERROR_MESSAGE()
+        RAISERROR(@ErrorMsg, 16, 1)
+    END CATCH
+END
+GO
+
+-- ============================================================
+-- BÖLÜM 4: TEST PROSEDÜRÜ
+-- ============================================================
+
+CREATE PROCEDURE dbo.sp_UretimMaliyetTest
+    @YIL INT,
+    @AY INT,
+    @HEDEF_DOVTIP TINYINT = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    DECLARE @BASLANGIC_TARIH DATETIME = DATEFROMPARTS(@YIL, @AY, 1)
+    DECLARE @BITIS_TARIH DATETIME = EOMONTH(@BASLANGIC_TARIH)
+    DECLARE @WMA_TARIH DATETIME = DATEADD(DAY, -1, @BASLANGIC_TARIH)
+    
+    PRINT '=========================================='
+    PRINT 'TEST - Weighted Moving Average'
+    PRINT 'Dönem: ' + CAST(@YIL AS VARCHAR) + '/' + RIGHT('0' + CAST(@AY AS VARCHAR), 2)
+    PRINT 'Döviz: ' + ISNULL(dbo.fn_DovizAdi(@HEDEF_DOVTIP), 'DİNAMİK')
+    PRINT 'WMA Tarihi: ' + CONVERT(VARCHAR, @WMA_TARIH, 104)
+    PRINT '=========================================='
+    
+    -- HAMMADDE ÇIKIŞLARI
+    SELECT 
+        h.FISNO,
+        h.STOK_KODU,
+        h.STHAR_TARIH,
+        CAST(h.STHAR_GCMIK AS DECIMAL(18,2)) AS MIKTAR,
+        dbo.fn_DovizAdi(ISNULL(h.STHAR_DOVTIP, 0)) AS MEVCUT_DOVIZ,
+        CAST(h.STHAR_DOVFIAT AS DECIMAL(18,2)) AS MEVCUT_FIYAT,
+        dbo.fn_DovizAdi(ISNULL(@HEDEF_DOVTIP, dbo.fn_StokDovizTip(h.STOK_KODU))) AS YENI_DOVIZ,
+        CAST(dbo.fn_WMA(h.STOK_KODU, @WMA_TARIH, @HEDEF_DOVTIP) AS DECIMAL(18,2)) AS YENI_WMA_FIYAT
+    FROM dbo.TBLSTHAR h
+    WHERE h.STHAR_GCKOD = 'C' AND h.STHAR_HTUR = 'C'
+      AND h.STHAR_TARIH >= @BASLANGIC_TARIH AND h.STHAR_TARIH <= @BITIS_TARIH
+    ORDER BY h.FISNO, h.STHAR_TARIH
+END
+GO
+
+-- ============================================================
+-- KULLANIM ÖRNEKLERİ
+-- ============================================================
+
+/*
+==========================================
+1. WMA HESAPLAMA
+==========================================
+
+-- Stokun kendi dövizinde WMA
+SELECT CAST(dbo.fn_WMA('STOK_KODU', '2025-12-31', NULL) AS DECIMAL(18,2)) AS WMA
+
+-- EUR cinsinden WMA
+SELECT CAST(dbo.fn_WMA_EUR('STOK_KODU', '2025-12-31') AS DECIMAL(18,2)) AS WMA_EUR
+
+-- İstenen dövizde WMA
+SELECT CAST(dbo.fn_WMA_Cevir('STOK_KODU', '2025-12-31', 0) AS DECIMAL(18,2)) AS WMA_TL
+SELECT CAST(dbo.fn_WMA_Cevir('STOK_KODU', '2025-12-31', 1) AS DECIMAL(18,2)) AS WMA_EUR
+SELECT CAST(dbo.fn_WMA_Cevir('STOK_KODU', '2025-12-31', 2) AS DECIMAL(18,2)) AS WMA_USD
+
+==========================================
+2. STOK LİSTESİ
+==========================================
+
+SELECT 
+    st.STOK_KODU,
+    st.STOK_ADI,
+    dbo.fn_DovizAdi(dbo.fn_StokDovizTip(st.STOK_KODU)) AS DOVIZ,
+    CAST(dbo.fn_WMA(st.STOK_KODU, GETDATE(), NULL) AS DECIMAL(18,2)) AS WMA_ORIJINAL,
+    CAST(dbo.fn_WMA_EUR(st.STOK_KODU, GETDATE()) AS DECIMAL(18,2)) AS WMA_EUR,
+    CAST(dbo.fn_WMA_Cevir(st.STOK_KODU, GETDATE(), 2) AS DECIMAL(18,2)) AS WMA_USD,
+    CAST(dbo.fn_WMA_Cevir(st.STOK_KODU, GETDATE(), 0) AS DECIMAL(18,2)) AS WMA_TL
+FROM TBLSTSABIT st
+WHERE EXISTS (SELECT 1 FROM TBLSTHAR h WHERE h.STOK_KODU = st.STOK_KODU AND h.STHAR_GCKOD = 'G')
+ORDER BY st.STOK_KODU
+
+==========================================
+3. PROSEDÜRLER
+==========================================
+
+-- Test
+EXEC dbo.sp_UretimMaliyetTest @YIL = 2025, @AY = 12
+EXEC dbo.sp_UretimMaliyetTest @YIL = 2025, @AY = 12, @HEDEF_DOVTIP = 1
+
+-- Güncelleme
+EXEC dbo.sp_UretimMaliyetGuncelle @YIL = 2025, @AY = 12
+EXEC dbo.sp_UretimMaliyetGuncelle @YIL = 2025, @AY = 12, @HEDEF_DOVTIP = 1
+
+==========================================
+4. WMA DETAY - TEK STOK İÇİN
+==========================================
+
+DECLARE @STOK VARCHAR(50) = 'STOK_KODU'
+DECLARE @TARIH DATETIME = '2025-12-31'
+
+-- Tüm hareketler
+SELECT 
+    STHAR_TARIH AS TARIH,
+    STHAR_GCKOD AS GC,
+    STHAR_HTUR AS HTUR,
+    CAST(STHAR_GCMIK AS DECIMAL(18,2)) AS MIKTAR,
+    dbo.fn_DovizAdi(ISNULL(STHAR_DOVTIP, 0)) AS DOVIZ,
+    CAST(STHAR_DOVFIAT AS DECIMAL(18,2)) AS DOVFIAT,
+    CAST(STHAR_NF AS DECIMAL(18,2)) AS NF,
+    CAST(SUM(CASE WHEN STHAR_GCKOD = 'G' THEN STHAR_GCMIK ELSE -STHAR_GCMIK END) 
+        OVER (ORDER BY STHAR_TARIH, INCKEYNO) AS DECIMAL(18,2)) AS BAKIYE
+FROM TBLSTHAR
+WHERE STOK_KODU = @STOK AND STHAR_TARIH <= @TARIH
+ORDER BY STHAR_TARIH, INCKEYNO
+
+-- WMA sonucu
+SELECT 
+    CAST(dbo.fn_WMA(@STOK, @TARIH, NULL) AS DECIMAL(18,2)) AS WMA_ORIJINAL,
+    CAST(dbo.fn_WMA_EUR(@STOK, @TARIH) AS DECIMAL(18,2)) AS WMA_EUR
+
+*/
