@@ -435,7 +435,25 @@ WHERE EXISTS (SELECT 1 FROM TBLSTHAR h WHERE h.STOK_KODU = st.STOK_KODU AND h.ST
 ORDER BY st.STOK_KODU
 
 ==========================================
-3. PROSEDÜRLER
+3. BELİRLİ TARİHE KADAR TÜM STOKLAR
+==========================================
+
+DECLARE @BITIS_TARIH DATETIME = '2025-12-31'  -- İstediğiniz tarihi girin
+
+SELECT 
+    st.STOK_KODU,
+    st.STOK_ADI,
+    dbo.fn_DovizAdi(dbo.fn_StokDovizTip(st.STOK_KODU)) AS DOVIZ,
+    CAST(dbo.fn_WMA(st.STOK_KODU, @BITIS_TARIH, NULL) AS DECIMAL(18,2)) AS WMA_ORIJINAL,
+    CAST(dbo.fn_WMA_EUR(st.STOK_KODU, @BITIS_TARIH) AS DECIMAL(18,2)) AS WMA_EUR,
+    CAST(dbo.fn_WMA_Cevir(st.STOK_KODU, @BITIS_TARIH, 2) AS DECIMAL(18,2)) AS WMA_USD,
+    CAST(dbo.fn_WMA_Cevir(st.STOK_KODU, @BITIS_TARIH, 0) AS DECIMAL(18,2)) AS WMA_TL
+FROM TBLSTSABIT st
+WHERE EXISTS (SELECT 1 FROM TBLSTHAR h WHERE h.STOK_KODU = st.STOK_KODU AND h.STHAR_GCKOD = 'G')
+ORDER BY st.STOK_KODU
+
+==========================================
+4. PROSEDÜRLER
 ==========================================
 
 -- Test
@@ -447,7 +465,7 @@ EXEC dbo.sp_UretimMaliyetGuncelle @YIL = 2025, @AY = 12
 EXEC dbo.sp_UretimMaliyetGuncelle @YIL = 2025, @AY = 12, @HEDEF_DOVTIP = 1
 
 ==========================================
-4. WMA DETAY - TEK STOK İÇİN
+5. WMA DETAY - TEK STOK İÇİN
 ==========================================
 
 DECLARE @STOK VARCHAR(50) = 'STOK_KODU'
