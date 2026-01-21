@@ -100,7 +100,8 @@ CREATE FUNCTION dbo.fn_WMA
 (
     @STOK_KODU VARCHAR(50),
     @TARIH DATETIME,
-    @DOVTIP TINYINT = NULL  -- NULL: Stokun kendi dövizi
+    @DOVTIP TINYINT = NULL,  -- NULL: Stokun kendi dövizi
+    @BASLANGIC_TARIH DATETIME = NULL  -- NULL: En baştan
 )
 RETURNS DECIMAL(28, 15)
 AS
@@ -140,6 +141,7 @@ BEGIN
         FROM dbo.TBLSTHAR
         WHERE STOK_KODU = @STOK_KODU
           AND STHAR_TARIH <= @TARIH
+          AND (@BASLANGIC_TARIH IS NULL OR STHAR_TARIH >= @BASLANGIC_TARIH)
           AND STHAR_GCMIK > 0
         ORDER BY STHAR_TARIH ASC, INCKEYNO ASC
     
@@ -182,12 +184,13 @@ GO
 CREATE FUNCTION dbo.fn_WMA_EUR
 (
     @STOK_KODU VARCHAR(50),
-    @TARIH DATETIME
+    @TARIH DATETIME,
+    @BASLANGIC_TARIH DATETIME = NULL
 )
 RETURNS DECIMAL(28, 15)
 AS
 BEGIN
-    RETURN dbo.fn_WMA(@STOK_KODU, @TARIH, 1)
+    RETURN dbo.fn_WMA(@STOK_KODU, @TARIH, 1, @BASLANGIC_TARIH)
 END
 GO
 
@@ -196,12 +199,13 @@ CREATE FUNCTION dbo.fn_WMA_Cevir
 (
     @STOK_KODU VARCHAR(50),
     @TARIH DATETIME,
-    @HEDEF_DOVTIP TINYINT
+    @HEDEF_DOVTIP TINYINT,
+    @BASLANGIC_TARIH DATETIME = NULL
 )
 RETURNS DECIMAL(28, 15)
 AS
 BEGIN
-    RETURN dbo.fn_WMA(@STOK_KODU, @TARIH, @HEDEF_DOVTIP)
+    RETURN dbo.fn_WMA(@STOK_KODU, @TARIH, @HEDEF_DOVTIP, @BASLANGIC_TARIH)
 END
 GO
 
@@ -212,7 +216,8 @@ GO
 CREATE PROCEDURE dbo.sp_UretimMaliyetGuncelle
     @YIL INT = NULL,
     @AY INT = NULL,
-    @HEDEF_DOVTIP TINYINT = NULL  -- NULL: Dinamik, 0:TL, 1:EUR, 2:USD
+    @HEDEF_DOVTIP TINYINT = NULL,  -- NULL: Dinamik, 0:TL, 1:EUR, 2:USD
+    @WMA_BASLANGIC DATETIME = NULL  -- NULL: En baştan
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -241,7 +246,7 @@ BEGIN
         IF @HEDEF_DOVTIP IS NULL
         BEGIN
             UPDATE h
-            SET h.STHAR_DOVFIAT = dbo.fn_WMA(h.STOK_KODU, @WMA_TARIH, NULL),
+            SET h.STHAR_DOVFIAT = dbo.fn_WMA(h.STOK_KODU, @WMA_TARIH, NULL, @WMA_BASLANGIC),
                 h.STHAR_DOVTIP = dbo.fn_StokDovizTip(h.STOK_KODU)
             FROM dbo.TBLSTHAR h
             WHERE h.STHAR_GCKOD = 'C'
@@ -252,7 +257,7 @@ BEGIN
         ELSE
         BEGIN
             UPDATE h
-            SET h.STHAR_DOVFIAT = dbo.fn_WMA(h.STOK_KODU, @WMA_TARIH, @HEDEF_DOVTIP),
+            SET h.STHAR_DOVFIAT = dbo.fn_WMA(h.STOK_KODU, @WMA_TARIH, @HEDEF_DOVTIP, @WMA_BASLANGIC),
                 h.STHAR_DOVTIP = @HEDEF_DOVTIP
             FROM dbo.TBLSTHAR h
             WHERE h.STHAR_GCKOD = 'C'
@@ -344,7 +349,8 @@ BEGIN
         PRINT 'Üretim Maliyet Güncelleme (WMA) Tamamlandı'
         PRINT 'Dönem: ' + CAST(@YIL AS VARCHAR) + '/' + RIGHT('0' + CAST(@AY AS VARCHAR), 2)
         PRINT 'Döviz: ' + ISNULL(dbo.fn_DovizAdi(@HEDEF_DOVTIP), 'DİNAMİK')
-        PRINT 'WMA Tarihi: ' + CONVERT(VARCHAR, @WMA_TARIH, 104)
+        PRINT 'WMA Bitiş Tarihi: ' + CONVERT(VARCHAR, @WMA_TARIH, 104)
+        PRINT 'WMA Başlangıç: ' + ISNULL(CONVERT(VARCHAR, @WMA_BASLANGIC, 104), 'EN BAŞTAN')
         PRINT 'Hammadde: ' + CAST(@HammaddeCount AS VARCHAR)
         PRINT 'Mamul: ' + CAST(@MamulCount AS VARCHAR)
         PRINT '=========================================='
@@ -365,7 +371,8 @@ GO
 CREATE PROCEDURE dbo.sp_UretimMaliyetTest
     @YIL INT,
     @AY INT,
-    @HEDEF_DOVTIP TINYINT = NULL
+    @HEDEF_DOVTIP TINYINT = NULL,
+    @WMA_BASLANGIC DATETIME = NULL  -- NULL: En baştan
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -378,7 +385,8 @@ BEGIN
     PRINT 'TEST - Weighted Moving Average'
     PRINT 'Dönem: ' + CAST(@YIL AS VARCHAR) + '/' + RIGHT('0' + CAST(@AY AS VARCHAR), 2)
     PRINT 'Döviz: ' + ISNULL(dbo.fn_DovizAdi(@HEDEF_DOVTIP), 'DİNAMİK')
-    PRINT 'WMA Tarihi: ' + CONVERT(VARCHAR, @WMA_TARIH, 104)
+    PRINT 'WMA Bitiş Tarihi: ' + CONVERT(VARCHAR, @WMA_TARIH, 104)
+    PRINT 'WMA Başlangıç: ' + ISNULL(CONVERT(VARCHAR, @WMA_BASLANGIC, 104), 'EN BAŞTAN')
     PRINT '=========================================='
     
     -- HAMMADDE ÇIKIŞLARI
@@ -390,7 +398,7 @@ BEGIN
         dbo.fn_DovizAdi(ISNULL(h.STHAR_DOVTIP, 0)) AS MEVCUT_DOVIZ,
         CAST(h.STHAR_DOVFIAT AS DECIMAL(18,2)) AS MEVCUT_FIYAT,
         dbo.fn_DovizAdi(ISNULL(@HEDEF_DOVTIP, dbo.fn_StokDovizTip(h.STOK_KODU))) AS YENI_DOVIZ,
-        CAST(dbo.fn_WMA(h.STOK_KODU, @WMA_TARIH, @HEDEF_DOVTIP) AS DECIMAL(18,2)) AS YENI_WMA_FIYAT
+        CAST(dbo.fn_WMA(h.STOK_KODU, @WMA_TARIH, @HEDEF_DOVTIP, @WMA_BASLANGIC) AS DECIMAL(18,2)) AS YENI_WMA_FIYAT
     FROM dbo.TBLSTHAR h
     WHERE h.STHAR_GCKOD = 'C' AND h.STHAR_HTUR = 'C'
       AND h.STHAR_TARIH >= @BASLANGIC_TARIH AND h.STHAR_TARIH <= @BITIS_TARIH
@@ -435,43 +443,54 @@ WHERE EXISTS (SELECT 1 FROM TBLSTHAR h WHERE h.STOK_KODU = st.STOK_KODU AND h.ST
 ORDER BY st.STOK_KODU
 
 ==========================================
-3. BELİRLİ TARİHE KADAR TÜM STOKLAR
+3. BELİRLİ TARİH ARALIĞINDA TÜM STOKLAR
 ==========================================
 
-DECLARE @BITIS_TARIH DATETIME = '2025-12-31'  -- İstediğiniz tarihi girin
+DECLARE @BASLANGIC_TARIH DATETIME = '2025-01-01'  -- Başlangıç tarihi
+DECLARE @BITIS_TARIH DATETIME = '2025-12-31'      -- Bitiş tarihi
 
 SELECT 
     st.STOK_KODU,
     st.STOK_ADI,
     dbo.fn_DovizAdi(dbo.fn_StokDovizTip(st.STOK_KODU)) AS DOVIZ,
-    CAST(dbo.fn_WMA(st.STOK_KODU, @BITIS_TARIH, NULL) AS DECIMAL(18,2)) AS WMA_ORIJINAL,
-    CAST(dbo.fn_WMA_EUR(st.STOK_KODU, @BITIS_TARIH) AS DECIMAL(18,2)) AS WMA_EUR,
-    CAST(dbo.fn_WMA_Cevir(st.STOK_KODU, @BITIS_TARIH, 2) AS DECIMAL(18,2)) AS WMA_USD,
-    CAST(dbo.fn_WMA_Cevir(st.STOK_KODU, @BITIS_TARIH, 0) AS DECIMAL(18,2)) AS WMA_TL
+    CAST(dbo.fn_WMA(st.STOK_KODU, @BITIS_TARIH, NULL, @BASLANGIC_TARIH) AS DECIMAL(18,2)) AS WMA_ORIJINAL,
+    CAST(dbo.fn_WMA_EUR(st.STOK_KODU, @BITIS_TARIH, @BASLANGIC_TARIH) AS DECIMAL(18,2)) AS WMA_EUR,
+    CAST(dbo.fn_WMA_Cevir(st.STOK_KODU, @BITIS_TARIH, 2, @BASLANGIC_TARIH) AS DECIMAL(18,2)) AS WMA_USD,
+    CAST(dbo.fn_WMA_Cevir(st.STOK_KODU, @BITIS_TARIH, 0, @BASLANGIC_TARIH) AS DECIMAL(18,2)) AS WMA_TL
 FROM TBLSTSABIT st
 WHERE EXISTS (SELECT 1 FROM TBLSTHAR h WHERE h.STOK_KODU = st.STOK_KODU AND h.STHAR_GCKOD = 'G')
 ORDER BY st.STOK_KODU
+
+-- Tek stok için tarih aralıklı WMA
+SELECT CAST(dbo.fn_WMA('STOK_KODU', '2025-12-31', NULL, '2025-01-01') AS DECIMAL(18,2)) AS WMA
 
 ==========================================
 4. PROSEDÜRLER
 ==========================================
 
--- Test
+-- Test (en baştan)
 EXEC dbo.sp_UretimMaliyetTest @YIL = 2025, @AY = 12
 EXEC dbo.sp_UretimMaliyetTest @YIL = 2025, @AY = 12, @HEDEF_DOVTIP = 1
 
--- Güncelleme
+-- Test (belirli tarihten başlayarak)
+EXEC dbo.sp_UretimMaliyetTest @YIL = 2025, @AY = 12, @HEDEF_DOVTIP = NULL, @WMA_BASLANGIC = '2025-01-01'
+
+-- Güncelleme (en baştan)
 EXEC dbo.sp_UretimMaliyetGuncelle @YIL = 2025, @AY = 12
 EXEC dbo.sp_UretimMaliyetGuncelle @YIL = 2025, @AY = 12, @HEDEF_DOVTIP = 1
+
+-- Güncelleme (belirli tarihten başlayarak)
+EXEC dbo.sp_UretimMaliyetGuncelle @YIL = 2025, @AY = 12, @HEDEF_DOVTIP = 1, @WMA_BASLANGIC = '2025-01-01'
 
 ==========================================
 5. WMA DETAY - TEK STOK İÇİN
 ==========================================
 
 DECLARE @STOK VARCHAR(50) = 'STOK_KODU'
-DECLARE @TARIH DATETIME = '2025-12-31'
+DECLARE @BASLANGIC DATETIME = '2025-01-01'  -- NULL yaparsanız en baştan hesaplar
+DECLARE @BITIS DATETIME = '2025-12-31'
 
--- Tüm hareketler
+-- Tüm hareketler (tarih aralığında)
 SELECT 
     STHAR_TARIH AS TARIH,
     STHAR_GCKOD AS GC,
@@ -483,12 +502,18 @@ SELECT
     CAST(SUM(CASE WHEN STHAR_GCKOD = 'G' THEN STHAR_GCMIK ELSE -STHAR_GCMIK END) 
         OVER (ORDER BY STHAR_TARIH, INCKEYNO) AS DECIMAL(18,2)) AS BAKIYE
 FROM TBLSTHAR
-WHERE STOK_KODU = @STOK AND STHAR_TARIH <= @TARIH
+WHERE STOK_KODU = @STOK 
+  AND STHAR_TARIH >= @BASLANGIC 
+  AND STHAR_TARIH <= @BITIS
 ORDER BY STHAR_TARIH, INCKEYNO
 
--- WMA sonucu
+-- WMA sonucu (tarih aralıklı)
 SELECT 
-    CAST(dbo.fn_WMA(@STOK, @TARIH, NULL) AS DECIMAL(18,2)) AS WMA_ORIJINAL,
-    CAST(dbo.fn_WMA_EUR(@STOK, @TARIH) AS DECIMAL(18,2)) AS WMA_EUR
+    CAST(dbo.fn_WMA(@STOK, @BITIS, NULL, @BASLANGIC) AS DECIMAL(18,2)) AS WMA_ORIJINAL,
+    CAST(dbo.fn_WMA_EUR(@STOK, @BITIS, @BASLANGIC) AS DECIMAL(18,2)) AS WMA_EUR
+
+-- WMA sonucu (en baştan)
+SELECT 
+    CAST(dbo.fn_WMA(@STOK, @BITIS, NULL, NULL) AS DECIMAL(18,2)) AS WMA_TUMZAMAN
 
 */
